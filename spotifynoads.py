@@ -13,11 +13,23 @@ DBus listening code based on:
 import argparse
 import os
 import dbus
-from subprocess import check_output, Popen, DEVNULL
+from subprocess import check_output, Popen, DEVNULL, CalledProcessError
 from gi.repository import GLib
 from dbus.mainloop.glib import DBusGMainLoop
 from dbus.exceptions import DBusException
 
+# Detect if pulseaudio or pipewire is running
+try:
+    pipewireQuery = check_output(['which', 'pactl'], universal_newlines=True)
+    driver            = 'pipewire'
+    ctlCmd            = 'pactl'
+    listSinkInputsCmd = ['pactl', 'list', 'sink-inputs']
+except CalledProcessError:
+    driver            = 'pulseaudio'
+    ctlCmd            = 'pacmd'
+    listSinkInputsCmd = ['pacmd', 'list-sink-inputs']
+
+print('Using', ctlCmd, 'for controlling sink inputs.')
 
 class PlayerAdMuter(object):
     
@@ -65,10 +77,13 @@ class PlayerAdMuter(object):
         pass
     
     def parse_sink_inputs(self, sinks):
-        detected_sinks = sinks.split("    index: ")
+        if driver == 'pacmd':
+            detected_sinks = sinks.split("    index: ")
+        else:
+            detected_sinks = sinks.split(" #")
         app_sinks = []
         for sink in detected_sinks:
-            index, pid, binary = None, None, None
+            index, pid, binary, latency = None, None, None, 0
             # index
             parts = sink.split('\n')
             try:
@@ -82,7 +97,7 @@ class PlayerAdMuter(object):
                 # process binary
                 elif 'application.process.binary = ' in part:
                     binary = part.split('application.process.binary = ')[1].split('"')[1]
-                # sink latency
+                # sink latency - pulseaudio 
                 elif 'current latency: ' in part:
                     l = part.split('current latency: ')[1].split(' ms')[0]
                     try:
@@ -90,6 +105,10 @@ class PlayerAdMuter(object):
                     # some old versions of pulse audio localize the output kind of weird and use commas for floating point values
                     except ValueError:
                         latency = float(l.replace(',', '.'))
+                # sink latency - pipewire
+                elif 'node.latency = ' in part:
+                    num, denom = part.split('node.latency = ')[1].split('"')[1].split('/')
+                    latency = int(num) / int(denom) * 1000
                 else:
                     continue
             if binary == self.app_name:
@@ -97,7 +116,7 @@ class PlayerAdMuter(object):
         return app_sinks
 
     def detect_app_sink(self):
-        all_sinks = check_output(['pacmd', 'list-sink-inputs'], universal_newlines=True)
+        all_sinks = check_output(listSinkInputsCmd, universal_newlines=True)
         self.sinks = self.parse_sink_inputs(all_sinks)
     
     def wait_latency(self):
@@ -115,7 +134,7 @@ class PlayerAdMuter(object):
                 if retcode is not None: # Sleep finished, mute/unmute sink
                     waiting_sinks.remove(sinkpair)
                     print(f'[spotifynoads.py] {action} {self.app_name} sink {sinkpair[0]}.')
-                    Popen(['pacmd', 'set-sink-input-mute', str(sinkpair[0]), str(mute)], stdout=DEVNULL, stderr=DEVNULL)
+                    Popen([ctlCmd, 'set-sink-input-mute', str(sinkpair[0]), str(mute)], stdout=DEVNULL, stderr=DEVNULL)
 
     def mute(self):
         if self.sinks:
@@ -123,7 +142,7 @@ class PlayerAdMuter(object):
             self.toggle_mute_after_waiting(waiting_sinks, 1)
         else:
             print(f'[spotifynoads.py] Mute master.')
-            os.system('amixer -q -D pulse sset Master off')
+            os.system('amixer -q sset Master off')
     
     def unmute(self):
         if self.sinks:
@@ -131,7 +150,7 @@ class PlayerAdMuter(object):
             self.toggle_mute_after_waiting(waiting_sinks, 0)
         else:
             print(f'[spotifynoads.py] Unmute master.')
-            os.system('amixer -q -D pulse sset Master on')
+            os.system('amixer -q sset Master on')
 
 
 class SpotifyAdMuter(PlayerAdMuter):
@@ -152,6 +171,14 @@ class SpotifyAdMuter(PlayerAdMuter):
         is_ad = trackid.startswith("spotify:ad:") or trackid.startswith("/com/spotify/ad/")
         print("[{app_name}] Playing new track.\n    trackid: {trackid}\n    title: {title}\n    artist: {artist}\n    album: {album}\n    is_ad: {is_ad}".format(
             app_name=self.app_name, trackid=trackid, title=title, album=album, artist=artist, is_ad=is_ad))
+        # Sometimes spotify opens a new sink just for ads, short after track change 
+        # notification
+        # If sinks are listed immediately after track change these might go unnoticed
+        # and ads can be heard.
+        # 
+        # Possible solutions:
+        #  - insert delay?
+        #  - scan sinks periodically?
         if is_ad:
             print('[spotifynoads.py] Ad starting, muting.')
             self.mute()
